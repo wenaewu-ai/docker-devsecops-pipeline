@@ -1,0 +1,10 @@
+# Trivy exceptions, read automatically by the security job in CI.
+# Add an entry only after confirming the risk is acceptable and no upgrade or replacement
+# is possible for now. Every entry needs a reason and an expiry date: once it expires,
+# Trivy blocks again and the decision has to be made again.
+#
+#   # <reason / who decided / date>
+#   CVE-2026-12345 exp:2026-12-31
+#
+# Misconfiguration rules use their ID (for example DS-0002), licenses use the license
+# name (for example LGPL-2.1-only).

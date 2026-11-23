@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Environment files hold credentials
+.env
+.env.*
+!.env.example
+
+# Database dumps may contain real data
+*.dump
+*.bak
+*.sql.gz
+
+# Sparse checkout used by the daily error report workflow on the server
+.daily-error-report/

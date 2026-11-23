@@ -1,0 +1,104 @@
+name: Daily error report
+
+# Every morning, summarise the previous day's anomalies on the production server and push
+# them to Telegram. Detection rules are in .github/scripts/daily_error_report.py.
+#
+# Repository secrets needed:
+#   TELEGRAM_TOKEN    bot token
+#   TELEGRAM_CHAT_ID  chat that receives the report (for a private chat, your own user id)
+on:
+  # Uncomment once a self-hosted runner is registered on the production server.
+  # schedule:
+  #   - cron: "23 0 * * *" # UTC
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Local date to report on (YYYY-MM-DD). Empty = yesterday"
+        type: string
+        default: ""
+      send:
+        description: "Send to Telegram (untick to only preview the report on the Summary page)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    name: Analyze logs and notify
+    # Runs on the production host (the same runner as the deploy job): that is where the
+    # container logs are.
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      # The runner context is not available in job-level env, so the work dir is set here.
+      - run: echo "WORK=$RUNNER_TEMP/daily-error-report" >> "$GITHUB_ENV"
+      # This workspace IS the production deployment (it holds .env and other files that are
+      # not in git), so the scripts are sparse-checked-out into a subdirectory and the
+      # workspace root is never touched.
+      - uses: actions/checkout@v4
+        with:
+          path: .daily-error-report
+          sparse-checkout: .github/scripts
+      - name: Collect container logs
+        env:
+          REPORT_DATE: ${{ inputs.date }}
+        run: |
+          rm -rf "$WORK"
+          # Seven extra days of history, to tell new problems from recurring ones.
+          since=$(date -u -d "${REPORT_DATE:-yesterday} -8 days" +%Y-%m-%dT00:00:00Z)
+          .daily-error-report/.github/scripts/container_logs.sh collect "$WORK/in" "$since"
+          # Report settings live in the deployment's .env, next to the backup schedule.
+          for key in BACKUP_TIME REPORT_UTC_OFFSET REPORT_PROJECT; do
+            value=$(grep -E "^${key}=" .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'\r" || true)
+            [ -n "$value" ] && echo "${key}=${value}" >> "$GITHUB_ENV"
+          done
+          exit 0
+      # The host may not have a recent Python, so the script runs in a pinned container
+      # (it only uses the standard library).
+      - id: analyze
+        name: Analyze and send
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPORT_DATE: ${{ inputs.date }}
+          SEND: ${{ github.event_name == 'schedule' || inputs.send }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          args=("$WORK/in" --out-dir "$WORK/out" --run-url "$RUN_URL")
+          [ -n "$REPORT_DATE" ] && args+=(--date "$REPORT_DATE")
+          [ "$SEND" = "true" ] && args+=(--send)
+          scripts="$PWD/.daily-error-report/.github/scripts"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -e TELEGRAM_TOKEN -e TELEGRAM_CHAT_ID -e BACKUP_TIME -e REPORT_UTC_OFFSET -e REPORT_PROJECT \
+            -v "$WORK:$WORK" -v "$scripts:/scripts:ro" \
+            python:3.12-alpine python /scripts/daily_error_report.py "${args[@]}"
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          [ -f "$WORK/out/message.txt" ] || exit 0
+          { echo '```'; cat "$WORK/out/message.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: daily-error-report-${{ github.run_id }}
+          path: ${{ runner.temp }}/daily-error-report/out/
+          if-no-files-found: ignore
+          retention-days: 30
+      # If the report did not go out (collection or analysis failed), send at least a
+      # one-line notice. Silence must never be mistaken for "nothing happened".
+      # If Telegram itself is misconfigured this fails too, and GitHub's failure email is
+      # the last line of defence.
+      - name: Notify failure
+        if: ${{ failure() && steps.analyze.outcome != 'success' }}
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPORT_DATE: ${{ inputs.date }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          day="${REPORT_DATE:-$(date -u -d yesterday +%F)}"
+          curl -fsS -o /dev/null "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=⚠️ The daily error report for ${day} could not be generated. See: ${RUN_URL}"

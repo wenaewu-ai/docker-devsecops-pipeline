@@ -1,0 +1,71 @@
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: applies pending migrations and exits. The app only starts once this has
+  # succeeded, so a release never serves traffic against a schema it does not expect.
+  migrate:
+    build: .
+    env_file: .env
+    command: ["python", "-m", "app.migrate"]
+    healthcheck:
+      disable: true
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    expose:
+      - "8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # One verified pg_dump per day at BACKUP_TIME, see backup/backup.sh.
+  backup:
+    image: postgres:17
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+    entrypoint: ["/bin/sh", "/backup.sh"]
+    command: ["--daemon"]
+    volumes:
+      - ./backup/backup.sh:/backup.sh:ro
+      # Named volume by default. In production point BACKUP_HOST_DIR at a path on a
+      # different disk (or a mounted network share) so a lost data disk does not take
+      # the backups with it.
+      - ${BACKUP_HOST_DIR:-backups}:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  backups:

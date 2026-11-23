@@ -1,0 +1,288 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Every Monday, rescan main (= what production runs) against the latest vulnerability
+  # database to catch CVEs published after the last deploy. GitHub emails on failure.
+  # A scheduled run never deploys.
+  schedule:
+    - cron: "47 23 * * 0"
+  # Manual re-deploy. In an emergency, force_deploy skips the security gate; it only works
+  # for the repository owner, and lint, tests and the smoke test must still pass.
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: "Emergency: deploy even if the security scan fails (repository owner only)"
+        type: boolean
+        default: false
+      reason:
+        description: "Reason for the forced deploy (recorded in the deploy log)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a run on main: it may be in the middle of a deploy.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint:
+    name: Lint (ruff, shellcheck, actionlint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.15.20
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: shellcheck .github/scripts/*.sh backup/*.sh
+      # A broken workflow file (for example a context used where it is not available) only
+      # fails when the workflow starts. Catch it here instead.
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
+
+  test:
+    name: Unit tests (pytest)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+
+  # Generates a CycloneDX SBOM and scans everything with Trivy. Deployment needs all of it
+  # to pass. The gate:
+  #   - Package vulnerabilities, HIGH/CRITICAL. Application packages (requirements.txt and
+  #     what pip installed in the image) block even when upstream has no fix yet: replace
+  #     the package or accept the risk in .trivyignore. OS packages of the base image only
+  #     block when a fix exists, because nothing can be done about the rest.
+  #   - Secrets and Dockerfile misconfigurations, HIGH/CRITICAL.
+  #   - Application packages under a forbidden license (for example AGPL).
+  # To accept a specific risk, add it to .trivyignore with a reason and an exp: date.
+  security:
+    name: Security scan (Trivy)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # sync findings to issues
+    env:
+      TRIVY_NO_PROGRESS: "true"
+      IMAGE: app:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.75.0
+      # Always fetch the latest database; its build time is shown on the Summary page.
+      - name: Download vulnerability DB
+        run: trivy image --download-db-only
+      - run: docker build -t "$IMAGE" .
+      # The SBOM is written outside the checkout so the filesystem scans below do not pick it up.
+      - name: SBOM (CycloneDX)
+        run: |
+          mkdir -p "$RUNNER_TEMP/sbom"
+          trivy image --format cyclonedx --output "$RUNNER_TEMP/sbom/image.cdx.json" "$IMAGE"
+          trivy fs --format cyclonedx --output "$RUNNER_TEMP/sbom/source.cdx.json" .
+      - id: sbom
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx-${{ github.sha }}
+          path: ${{ runner.temp }}/sbom/
+      # Every scan below runs with !cancelled(), so one failure does not hide the others
+      # and the report is always complete.
+      - id: scan_fs
+        name: Scan source (vuln / secret / misconfig)
+        if: ${{ !cancelled() }}
+        run: trivy fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 .
+      - id: scan_lib
+        name: Scan image - app libraries (vuln)
+        if: ${{ !cancelled() }}
+        run: trivy image --scanners vuln --pkg-types library --severity HIGH,CRITICAL --exit-code 1 "$IMAGE"
+      - id: scan_os
+        name: Scan image - OS packages (vuln, fixable only)
+        if: ${{ !cancelled() }}
+        run: trivy image --scanners vuln --pkg-types os --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 "$IMAGE"
+      - id: scan_secret
+        name: Scan image (secret)
+        if: ${{ !cancelled() }}
+        run: trivy image --scanners secret --severity HIGH,CRITICAL --exit-code 1 "$IMAGE"
+      - id: scan_license
+        name: Scan image - app libraries (license)
+        if: ${{ !cancelled() }}
+        run: trivy image --scanners license --pkg-types library --severity CRITICAL --exit-code 1 "$IMAGE"
+      # Full reports, every severity: input for the Summary page and the issue sync, and
+      # uploaded as an artifact (.json for programs, .txt tables for people).
+      - id: reports
+        name: Full reports
+        if: ${{ !cancelled() }}
+        run: |
+          R="$RUNNER_TEMP/trivy-reports"
+          mkdir -p "$R"
+          rc=0
+          trivy version --format json > "$R/version.json" || rc=1
+          trivy fs --scanners vuln,secret,misconfig --format json --output "$R/fs.json" . || rc=1
+          trivy image --scanners vuln,secret --format json --output "$R/image.json" "$IMAGE" || rc=1
+          trivy image --scanners license --pkg-types library --format json --output "$R/license.json" "$IMAGE" || rc=1
+          for f in fs image license; do
+            [ -f "$R/$f.json" ] && trivy convert --format table --output "$R/$f.txt" "$R/$f.json"
+          done
+          exit $rc
+      - id: reports_artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-reports-${{ github.sha }}
+          path: ${{ runner.temp }}/trivy-reports/
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          R="$RUNNER_TEMP/trivy-reports"
+          python3 .github/scripts/trivy_summary.py --version "$R/version.json" \
+            --check "Source (package vulnerabilities / secrets / Dockerfile)=${{ steps.scan_fs.outcome }}" \
+            --check "Image: application package vulnerabilities=${{ steps.scan_lib.outcome }}" \
+            --check "Image: OS package vulnerabilities (with a fix)=${{ steps.scan_os.outcome }}" \
+            --check "Image: secrets=${{ steps.scan_secret.outcome }}" \
+            --check "Image: application package licenses=${{ steps.scan_license.outcome }}" \
+            --artifact "SBOM (CycloneDX)=${{ steps.sbom.outputs.artifact-url }}" \
+            --artifact "Full scan reports (JSON + tables)=${{ steps.reports_artifact.outputs.artifact-url }}" \
+            "$R/fs.json" "$R/image.json" "$R/license.json" >> "$GITHUB_STEP_SUMMARY"
+      # Open, update and close issues for the items that need work, with a priority label
+      # by severity (rules in .github/scripts/trivy_issues.py). Only results on main are
+      # synced; a pull request just shows the checks. If any full report failed to
+      # generate, nothing is synced, so an incomplete result can never close an issue.
+      - name: Sync findings to issues
+        if: ${{ !cancelled() && steps.reports.outcome == 'success' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          R="$RUNNER_TEMP/trivy-reports"
+          python3 .github/scripts/trivy_issues.py "$R/fs.json" "$R/image.json" "$R/license.json"
+
+  # Starts the real stack on the runner exactly the way the server does, then proves the
+  # operational parts work: migrations, a verified backup, and the daily error report
+  # catching an outage that is injected on purpose.
+  smoke:
+    name: Smoke test (full stack + injected outage)
+    runs-on: ubuntu-latest
+    needs: test
+    env:
+      BASE: http://localhost:8080
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - name: Start the stack (waits for health checks; migrations run first)
+        run: docker compose up -d --build --wait
+      - name: API round trip through nginx
+        run: |
+          curl -fsS "$BASE/healthz"
+          curl -fsS -X POST "$BASE/api/notes" -H 'content-type: application/json' -d '{"body":"smoke test"}'
+          curl -fsS "$BASE/api/notes" | grep -q 'smoke test'
+      - name: Migrations are idempotent
+        run: docker compose run --rm -T migrate | tee /dev/stderr | grep -q '0 applied'
+      # Output is sent to the container's main log (PID 1 stdout), where the scheduled
+      # backups write too, so the daily report below sees this backup.
+      - name: Take and verify a backup
+        run: |
+          docker compose exec -T backup sh -c '/bin/sh /backup.sh > /proc/1/fd/1 2>&1'
+          docker compose exec -T backup sh -c 'ls -l /backups/*.dump'
+      - name: Inject a database outage, then recover
+        run: |
+          docker compose stop db
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/notes")
+            echo "request $i during the outage: HTTP $code"
+            [ "$code" = "500" ]
+          done
+          # The error must not leak internals to the client.
+          curl -s "$BASE/api/notes" | grep -q '"internal_error"'
+          docker compose up -d --wait db
+          curl -fsS --retry 10 --retry-delay 2 --retry-all-errors "$BASE/api/notes" > /dev/null
+          echo "recovered"
+      - name: Daily error report must have caught the outage
+        run: |
+          W="$RUNNER_TEMP/daily-error-report"
+          set -a; . ./.env; set +a
+          .github/scripts/container_logs.sh collect "$W/in" "$(date -u -d '8 days ago' +%Y-%m-%dT00:00:00Z)"
+          python3 .github/scripts/daily_error_report.py "$W/in" --date "$(date -u +%F)" --out-dir "$W/out"
+          grep -q 'Unhandled error GET /api/notes → psycopg.OperationalError' "$W/out/message.txt"
+          grep -q 'nginx: HTTP 500 GET /api/notes' "$W/out/message.txt"
+          grep -q 'Database backup: ✅' "$W/out/message.txt"
+          {
+            echo '## Daily error report (demo: a database outage was injected on purpose)'
+            echo
+            echo 'This is the message the report sends to Telegram every morning in production.'
+            echo
+            echo '```'
+            cat "$W/out/message.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: daily-error-report-demo-${{ github.sha }}
+          path: ${{ runner.temp }}/daily-error-report/out/
+          if-no-files-found: ignore
+      - name: Container state and logs (on failure)
+        if: ${{ failure() }}
+        run: |
+          docker compose ps -a
+          docker compose logs --tail 200
+
+  # Runs on the production server itself through a self-hosted runner, so the server needs
+  # no inbound SSH and no deploy credentials are stored on GitHub.
+  # Disabled until the repository variable DEPLOY_ENABLED is set to "true" (see README).
+  deploy:
+    name: Deploy to production
+    runs-on: self-hosted
+    needs: [test, security, smoke]
+    # Normal case: push to main or manual run, with test, smoke and security all green.
+    # Emergency: the repository owner runs it manually with force_deploy, which skips
+    # security only.
+    if: >-
+      !cancelled() &&
+      vars.DEPLOY_ENABLED == 'true' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      needs.test.result == 'success' &&
+      needs.smoke.result == 'success' &&
+      (needs.security.result == 'success' ||
+       (github.event_name == 'workflow_dispatch' && inputs.force_deploy && github.actor == github.repository_owner))
+    steps:
+      - name: Record forced deploy
+        if: needs.security.result != 'success'
+        env:
+          REASON: ${{ inputs.reason }}
+        run: echo "::warning::Forced deploy, security=${{ needs.security.result }}, triggered by ${{ github.actor }}, reason ${REASON:-(none given)}"
+      - uses: actions/checkout@v4
+        with:
+          clean: false # keep host-only files that are not in git, such as .env
+      - run: test -f .env || (echo "::error::.env is missing on this host, see .env.example" && exit 1)
+      # Recreating a container drops its log. Save the logs first so tomorrow's daily error
+      # report can still see what happened before this deploy. A failure here does not
+      # block the deploy.
+      - name: Archive container logs before recreate
+        continue-on-error: true
+        run: .github/scripts/container_logs.sh archive
+      # Builds the image, applies pending migrations (the one-shot migrate service), starts
+      # the app and returns only when every health check passes. If a migration or a health
+      # check fails, the job fails and the app container is not replaced.
+      - run: docker compose up -d --build --wait
+      # nginx.conf is bind-mounted, not baked into an image, so compose does not recreate
+      # nginx when only the file's content changes. A fresh container guarantees the
+      # current config is the one loaded.
+      - name: Recreate nginx to pick up config changes
+        run: docker compose up -d --force-recreate --wait nginx
+      - name: Verify the release answers
+        run: |
+          set -a; . ./.env; set +a
+          curl -fsS --retry 10 --retry-delay 2 --retry-all-errors "http://localhost:${HTTP_PORT:-8080}/healthz"
