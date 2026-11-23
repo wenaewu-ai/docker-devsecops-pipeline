@@ -37,7 +37,7 @@ jobs:
       # This workspace IS the production deployment (it holds .env and other files that are
       # not in git), so the scripts are sparse-checked-out into a subdirectory and the
       # workspace root is never touched.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: .daily-error-report
           sparse-checkout: .github/scripts
@@ -79,7 +79,7 @@ jobs:
         run: |
           [ -f "$WORK/out/message.txt" ] || exit 0
           { echo '```'; cat "$WORK/out/message.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: daily-error-report-${{ github.run_id }}

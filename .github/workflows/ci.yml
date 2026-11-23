@@ -35,8 +35,8 @@ jobs:
     name: Lint (ruff, shellcheck, actionlint)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install ruff==0.15.20
@@ -53,8 +53,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
@@ -79,7 +79,7 @@ jobs:
       TRIVY_NO_PROGRESS: "true"
       IMAGE: app:${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
         with:
           version: v0.75.0
@@ -94,7 +94,7 @@ jobs:
           trivy image --format cyclonedx --output "$RUNNER_TEMP/sbom/image.cdx.json" "$IMAGE"
           trivy fs --format cyclonedx --output "$RUNNER_TEMP/sbom/source.cdx.json" .
       - id: sbom
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-cyclonedx-${{ github.sha }}
           path: ${{ runner.temp }}/sbom/
@@ -139,7 +139,7 @@ jobs:
           exit $rc
       - id: reports_artifact
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: trivy-reports-${{ github.sha }}
           path: ${{ runner.temp }}/trivy-reports/
@@ -178,7 +178,7 @@ jobs:
     env:
       BASE: http://localhost:8080
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cp .env.example .env
       - name: Start the stack (waits for health checks; migrations run first)
         run: docker compose up -d --build --wait
@@ -226,7 +226,7 @@ jobs:
             cat "$W/out/message.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: daily-error-report-demo-${{ github.sha }}
@@ -263,7 +263,7 @@ jobs:
         env:
           REASON: ${{ inputs.reason }}
         run: echo "::warning::Forced deploy, security=${{ needs.security.result }}, triggered by ${{ github.actor }}, reason ${REASON:-(none given)}"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           clean: false # keep host-only files that are not in git, such as .env
       - run: test -f .env || (echo "::error::.env is missing on this host, see .env.example" && exit 1)
